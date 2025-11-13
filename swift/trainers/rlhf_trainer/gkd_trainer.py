@@ -171,10 +171,10 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 data['messages'] = replace_assistant_response_with_ids(data['messages'], data['response_token_ids'])
             
             encoded = None
-            if data.rollout_infos.get('input_ids') and data.rollout_infos.get('labels'):
+            if data['rollout_infos'].get('input_ids') and data['rollout_infos'].get('labels'):
                 encoded = {
-                    'input_ids': data.rollout_infos['input_ids'],
-                    'labels': data.rollout_infos['labels'],
+                    'input_ids': data['rollout_infos']['input_ids'],
+                    'labels': data['rollout_infos']['labels'],
                 }
             else:
                 encoded = template.encode(data, return_length=True)
