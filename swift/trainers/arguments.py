@@ -328,7 +328,7 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     importance_sampling_level: Literal['token', 'sequence', 'sequence_token'] = 'token'
 
     # RLOO, REINFORCE++
-    advantage_estimator: Literal['grpo', 'rloo', 'reinforce_plus_plus'] = 'grpo'
+    advantage_estimator: Literal['grpo', 'rloo', 'reinforce_plus_plus', 'opd'] = 'grpo'
     # If false, add KL into loss, otherwise add into reward
     kl_in_reward: Optional[bool] = None  # rloo/reinforce_plus_plus: true, grpo: false (default)
 

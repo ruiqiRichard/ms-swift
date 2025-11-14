@@ -26,6 +26,7 @@ from trl.trainer.utils import selective_log_softmax
 
 from swift.llm import RowPreprocessor, Template, to_device
 from swift.llm.template.template_inputs import TemplateInputs
+from swift.llm.template.base import MaxLengthError
 from swift.plugin import orms, rm_plugins
 from swift.utils import (JsonlWriter, get_logger, is_swanlab_available, is_wandb_available, remove_response,
                          seed_worker, unwrap_model_for_generation)
@@ -427,14 +428,17 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     kl = torch.cat([(kl * mask).sum(-1) for kl, mask in zip(per_token_kl, completion_masks)])
                 else:
                     per_token_kl = old_per_token_logps - ref_per_token_logps
-                    kl = (per_token_kl * completion_mask).sum(-1)
+                    if self.advantage_estimator == 'opd':
+                        kl = (per_token_kl * completion_mask)
+                    else:
+                        kl = (per_token_kl * completion_mask).sum(-1)
                 kl_list.append(kl)
 
             kl = torch.cat(kl_list, dim=0)
             kl = gather(kl)
             mode = 'train' if self.model.training else 'eval'
             self._metrics[mode]['kl'].append(kl.nanmean().item())
-            rewards = rewards - self.beta * kl
+            rewards = rewards - self.beta * kl if self.advantage_estimator != 'opd' else -self.beta * kl
 
         # --------------------------------------------------
         # Case 1: Default grouped mode
@@ -455,6 +459,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 # A_i = r_i - mean(r_j for j != i)
                 # = r_i * K/(K-1) - mean_all * K/(K-1)
                 advantages = rewards * K / (K - 1) - group_rewards_mean * K / (K - 1)
+            elif self.advantage_estimator == 'opd':
+                advantages = rewards
             else:  # 'grpo' or 'reinforce_plus_plus'
                 # Both use group mean as baseline
                 advantages = rewards - group_rewards_mean
@@ -773,6 +779,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         for batch in gas_chunks:
             # Encode and process each batch (size=bs)
             with self._template_context(template):
+                batch_encoded_inputs = []
                 for data in batch:
                     if 'response_token_ids' in data and data['response_token_ids']:
                         loss_mask = None
@@ -780,7 +787,30 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                             loss_mask = data['response_loss_mask']
                         data['messages'] = replace_assistant_response_with_ids(data['messages'],
                                                                                data['response_token_ids'], loss_mask)
-                batch_encoded_inputs = [template.encode(data, return_length=True) for data in batch]
+                    if 'rollout_infos' in data and data['rollout_infos'].get('input_ids') and data['rollout_infos'].get('labels'):
+                        encoded = {
+                            'input_ids': data['rollout_infos']['input_ids'],
+                            'labels': data['rollout_infos']['labels'],
+                        }
+                        input_ids = encoded.get('input_ids')
+                        labels = encoded.get('labels')
+                        loss_scale = encoded.get('loss_scale')
+                        length = self.template._get_length(input_ids, labels)
+                        if self.template.max_length is not None and length > self.template.max_length:
+                            if self.template.truncation_strategy in {'right', 'left'}:
+                                input_ids, labels, loss_scale = self.template._truncate(
+                                    input_ids, labels, loss_scale, truncation_strategy=self.template.truncation_strategy)
+                                length = self.template._get_length(input_ids, labels)
+                            elif self.template.truncation_strategy == 'raise':
+                                raise MaxLengthError(f'Current length of row({length}) is larger'
+                                                    f' than the max_length({self.template.max_length}).')
+                        encoded['length'] = length
+                        encoded['input_ids'] = input_ids
+                        encoded['labels'] = labels
+                        encoded['loss_scale'] = loss_scale
+                        batch_encoded_inputs.append(encoded)
+                    else:
+                        batch_encoded_inputs.append(template.encode(data, return_length=True))
                 batch_encoded_inputs = to_device(template.data_collator(batch_encoded_inputs), self.model.device)
                 if self.dynamic_num_samples and self.is_multimodal:
                     batch_encoded_inputs['_origin_data'] = batch
@@ -1018,13 +1048,13 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 coef_1 = torch.repeat_interleave(coef_1.squeeze(-1), lengths).unsqueeze(0)
                 coef_2 = torch.repeat_interleave(coef_2.squeeze(-1), lengths).unsqueeze(0)
 
-            advantages = advantages[-coef_1.shape[1]:]
-            per_token_loss1 = coef_1 * advantages.unsqueeze(0)
-            per_token_loss2 = coef_2 * advantages.unsqueeze(0)
+            advantages = advantages[-coef_1.shape[1]:] if self.advantage_estimator != 'opd' else advantages[:, -coef_1.shape[1]:]
+            per_token_loss1 = coef_1 * advantages.unsqueeze(0) if self.advantage_estimator != 'opd' else coef_1 * advantages
+            per_token_loss2 = coef_2 * advantages.unsqueeze(0) if self.advantage_estimator != 'opd' else coef_2 * advantages
         else:
-            per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-            per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+            per_token_loss1 = coef_1 * advantages.unsqueeze(1) if self.advantage_estimator != 'opd' else coef_1 * advantages
+            per_token_loss2 = coef_2 * advantages.unsqueeze(1) if self.advantage_estimator != 'opd' else coef_2 * advantages
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2) if self.advantage_estimator != 'opd' else -per_token_loss1
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
         if per_token_kl is not None:
@@ -1069,8 +1099,14 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             metrics_data['kl'] = self.accelerator.gather_for_metrics(mean_kl).nanmean().item()
 
         # Compute the clipped probability ratios
-        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
-        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
+        is_low_clipped = None
+        is_high_clipped = None
+        if self.advantage_estimator != 'opd':
+            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
+            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
+        else:
+            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
+            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
         is_region_clipped = is_low_clipped | is_high_clipped
 
         low_clip = masked_batch_mean(is_low_clipped.float())
